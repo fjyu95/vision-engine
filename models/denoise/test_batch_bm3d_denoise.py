@@ -20,6 +20,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import statistics
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -28,6 +29,7 @@ from typing import List, Optional, Tuple
 
 import bm3d
 import cv2
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 from skimage.restoration import estimate_sigma
 from skimage.util import random_noise
 from tqdm import tqdm
@@ -47,6 +49,13 @@ class TaskResult:
     output_path: Optional[str]
     status: str
     elapsed_seconds: float
+    psnr_before: Optional[float] = None
+    psnr_after: Optional[float] = None
+    ssim_before: Optional[float] = None
+    ssim_after: Optional[float] = None
+    psnr_improvement: Optional[float] = None
+    ssim_improvement: Optional[float] = None
+    sigma_psd_used: Optional[object] = None
     error: Optional[str] = None
 
 
@@ -61,6 +70,21 @@ class BatchReport:
     sigma: Optional[float]
     total_seconds: float
     avg_seconds_per_file: float
+    metrics_count: int
+    avg_psnr_before: Optional[float]
+    avg_psnr_after: Optional[float]
+    avg_psnr_improvement: Optional[float]
+    median_psnr_improvement: Optional[float]
+    std_psnr_improvement: Optional[float]
+    min_psnr_improvement: Optional[float]
+    max_psnr_improvement: Optional[float]
+    avg_ssim_before: Optional[float]
+    avg_ssim_after: Optional[float]
+    avg_ssim_improvement: Optional[float]
+    median_ssim_improvement: Optional[float]
+    std_ssim_improvement: Optional[float]
+    min_ssim_improvement: Optional[float]
+    max_ssim_improvement: Optional[float]
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,6 +134,12 @@ def parse_args() -> argparse.Namespace:
         default="ERROR",
         choices=["SILENT", "FATAL", "ERROR", "WARNING", "INFO", "DEBUG"],
         help="OpenCV日志级别",
+    )
+    parser.add_argument(
+        "--reference-dir",
+        type=str,
+        default=None,
+        help="参考干净图目录（可选），用于计算PSNR/SSIM。若不传且--add-noise开启，则原图作为参考。",
     )
     return parser.parse_args()
 
@@ -204,6 +234,24 @@ def write_image(path: Path, img, color_order: str) -> bool:
     return cv2.imwrite(str(path), output)
 
 
+def calc_stats(values: List[float]) -> dict:
+    if not values:
+        return {
+            "avg": None,
+            "median": None,
+            "std": None,
+            "min": None,
+            "max": None,
+        }
+    return {
+        "avg": sum(values) / len(values),
+        "median": statistics.median(values),
+        "std": statistics.pstdev(values) if len(values) > 1 else 0.0,
+        "min": min(values),
+        "max": max(values),
+    }
+
+
 def process_one(
     input_path: str,
     input_root: str,
@@ -211,6 +259,7 @@ def process_one(
     sigma: Optional[float],
     add_noise: bool,
     average_sigmas: bool,
+    reference_dir: Optional[str],
     suffix: str,
     resume: bool,
     flat: bool,
@@ -223,15 +272,17 @@ def process_one(
     dst = build_output_path(src, in_root, out_root, suffix, flat)
 
     if resume and dst.exists():
-        return TaskResult(
-            str(src), str(dst), "skipped", time.perf_counter() - start, None
-        )
+        return TaskResult(str(src), str(dst), "skipped", time.perf_counter() - start)
 
     set_opencv_log_level(opencv_log_level)
     img, color_order = read_image(src)
     if img is None:
         return TaskResult(
-            str(src), None, "failed", time.perf_counter() - start, "输入图像不可读"
+            str(src),
+            None,
+            "failed",
+            time.perf_counter() - start,
+            error="输入图像不可读",
         )
 
     is_gray = (img.ndim == 2) or (img.ndim == 3 and img.shape[2] == 1)
@@ -241,6 +292,22 @@ def process_one(
         working_color_order = "RGB"
     scale, dtype_name = infer_scale_and_dtype(img)
     img_f = to_float01(img, scale)
+    reference_img_f = None
+    if add_noise:
+        reference_img_f = img_f
+    elif reference_dir:
+        ref_root = Path(reference_dir)
+        ref_path = ref_root / src.relative_to(in_root)
+        if ref_path.exists():
+            ref_img, ref_color = read_image(ref_path)
+            if ref_img is not None:
+                ref_gray = (ref_img.ndim == 2) or (
+                    ref_img.ndim == 3 and ref_img.shape[2] == 1
+                )
+                if not ref_gray and ref_color == "BGR":
+                    ref_img = cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB)
+                ref_scale, _ = infer_scale_and_dtype(ref_img)
+                reference_img_f = to_float01(ref_img, ref_scale)
 
     if add_noise:
         noise_sigma = 25.0 if sigma is None else float(sigma)
@@ -274,14 +341,61 @@ def process_one(
                 str(dst),
                 "failed",
                 time.perf_counter() - start,
-                "输出写入失败",
+                error="输出写入失败",
             )
     except Exception as e:
         return TaskResult(
-            str(src), str(dst), "failed", time.perf_counter() - start, str(e)
+            str(src), str(dst), "failed", time.perf_counter() - start, error=str(e)
         )
+    psnr_before = None
+    psnr_after = None
+    ssim_before = None
+    ssim_after = None
+    psnr_improvement = None
+    ssim_improvement = None
+    if reference_img_f is not None and reference_img_f.shape == denoise_input.shape:
+        try:
+            channel_axis = -1 if reference_img_f.ndim == 3 else None
+            psnr_before = float(
+                peak_signal_noise_ratio(reference_img_f, denoise_input, data_range=1.0)
+            )
+            psnr_after = float(
+                peak_signal_noise_ratio(reference_img_f, denoised, data_range=1.0)
+            )
+            ssim_before = float(
+                structural_similarity(
+                    reference_img_f,
+                    denoise_input,
+                    data_range=1.0,
+                    channel_axis=channel_axis,
+                )
+            )
+            ssim_after = float(
+                structural_similarity(
+                    reference_img_f,
+                    denoised,
+                    data_range=1.0,
+                    channel_axis=channel_axis,
+                )
+            )
+            psnr_improvement = psnr_after - psnr_before
+            ssim_improvement = ssim_after - ssim_before
+        except Exception:
+            pass
 
-    return TaskResult(str(src), str(dst), "success", time.perf_counter() - start, None)
+    return TaskResult(
+        str(src),
+        str(dst),
+        "success",
+        time.perf_counter() - start,
+        psnr_before=psnr_before,
+        psnr_after=psnr_after,
+        ssim_before=ssim_before,
+        ssim_after=ssim_after,
+        psnr_improvement=psnr_improvement,
+        ssim_improvement=ssim_improvement,
+        sigma_psd_used=sigma_psd,
+    )
 
 
 def main() -> int:
@@ -297,8 +411,8 @@ def main() -> int:
         raise FileNotFoundError(f"输入目录不存在或不是目录: {input_dir}")
 
     images = discover_images(input_dir, args.recursive)
-    # images = images[::2]
-    images = images[:10]
+    images = images[::3]
+    # images = images[:10]
     if not images:
         raise FileNotFoundError(
             f"未发现可处理图像，支持: {sorted(SUPPORTED_EXTENSIONS)}"
@@ -321,6 +435,7 @@ def main() -> int:
                 args.sigma,
                 bool(args.add_noise),
                 bool(args.average_sigmas),
+                args.reference_dir,
                 str(args.suffix),
                 bool(args.resume),
                 bool(args.flat),
@@ -341,6 +456,30 @@ def main() -> int:
                 skipped += 1
 
     total_seconds = time.perf_counter() - started
+    metric_results = [
+        r
+        for r in results
+        if r.status == "success"
+        and r.psnr_before is not None
+        and r.psnr_after is not None
+        and r.ssim_before is not None
+        and r.ssim_after is not None
+    ]
+    metrics_count = len(metric_results)
+    psnr_before_vals = [r.psnr_before for r in metric_results]
+    psnr_after_vals = [r.psnr_after for r in metric_results]
+    psnr_improvement_vals = [r.psnr_improvement for r in metric_results]
+    ssim_before_vals = [r.ssim_before for r in metric_results]
+    ssim_after_vals = [r.ssim_after for r in metric_results]
+    ssim_improvement_vals = [r.ssim_improvement for r in metric_results]
+
+    psnr_before_stats = calc_stats(psnr_before_vals)
+    psnr_after_stats = calc_stats(psnr_after_vals)
+    psnr_improvement_stats = calc_stats(psnr_improvement_vals)
+    ssim_before_stats = calc_stats(ssim_before_vals)
+    ssim_after_stats = calc_stats(ssim_after_vals)
+    ssim_improvement_stats = calc_stats(ssim_improvement_vals)
+
     report = BatchReport(
         total=len(images),
         success=success,
@@ -351,11 +490,50 @@ def main() -> int:
         sigma=args.sigma,
         total_seconds=total_seconds,
         avg_seconds_per_file=total_seconds / max(1, len(images)),
+        metrics_count=metrics_count,
+        avg_psnr_before=psnr_before_stats["avg"],
+        avg_psnr_after=psnr_after_stats["avg"],
+        avg_psnr_improvement=psnr_improvement_stats["avg"],
+        median_psnr_improvement=psnr_improvement_stats["median"],
+        std_psnr_improvement=psnr_improvement_stats["std"],
+        min_psnr_improvement=psnr_improvement_stats["min"],
+        max_psnr_improvement=psnr_improvement_stats["max"],
+        avg_ssim_before=ssim_before_stats["avg"],
+        avg_ssim_after=ssim_after_stats["avg"],
+        avg_ssim_improvement=ssim_improvement_stats["avg"],
+        median_ssim_improvement=ssim_improvement_stats["median"],
+        std_ssim_improvement=ssim_improvement_stats["std"],
+        min_ssim_improvement=ssim_improvement_stats["min"],
+        max_ssim_improvement=ssim_improvement_stats["max"],
     )
 
     failed_items = [asdict(r) for r in results if r.status == "failed"]
     summary = {
         "report": asdict(report),
+        "metrics": {
+            "metrics_count": metrics_count,
+            "psnr_before": psnr_before_stats,
+            "psnr_after": psnr_after_stats,
+            "psnr_improvement": psnr_improvement_stats,
+            "ssim_before": ssim_before_stats,
+            "ssim_after": ssim_after_stats,
+            "ssim_improvement": ssim_improvement_stats,
+        },
+        "per_file_metrics": [
+            {
+                "input_path": r.input_path,
+                "output_path": r.output_path,
+                "psnr_before": r.psnr_before,
+                "psnr_after": r.psnr_after,
+                "psnr_improvement": r.psnr_improvement,
+                "ssim_before": r.ssim_before,
+                "ssim_after": r.ssim_after,
+                "ssim_improvement": r.ssim_improvement,
+                "sigma_psd_used": r.sigma_psd_used,
+            }
+            for r in results
+            if r.status == "success"
+        ],
         "failed_items": failed_items,
     }
     report_path = output_dir / "bm3d_batch_report.json"
@@ -370,6 +548,25 @@ def main() -> int:
         f"failed={report.failed}, skipped={report.skipped}, "
         f"time={report.total_seconds:.4f}s"
     )
+    if report.metrics_count > 0:
+        print(
+            f"指标: PSNR {report.avg_psnr_before:.4f} -> {report.avg_psnr_after:.4f} "
+            f"(+{report.avg_psnr_improvement:.4f}), "
+            f"SSIM {report.avg_ssim_before:.6f} -> {report.avg_ssim_after:.6f} "
+            f"(+{report.avg_ssim_improvement:.6f})"
+        )
+        print(
+            f"提升统计: PSNR Δ中位数={report.median_psnr_improvement:.4f}, "
+            f"Δ标准差={report.std_psnr_improvement:.4f}, "
+            f"Δ范围=[{report.min_psnr_improvement:.4f}, {report.max_psnr_improvement:.4f}]"
+        )
+        print(
+            f"提升统计: SSIM Δ中位数={report.median_ssim_improvement:.6f}, "
+            f"Δ标准差={report.std_ssim_improvement:.6f}, "
+            f"Δ范围=[{report.min_ssim_improvement:.6f}, {report.max_ssim_improvement:.6f}]"
+        )
+    else:
+        print("指标: 未计算（请使用 --add-noise 或提供 --reference-dir）")
     print(f"报告: {report_path}")
     return 0 if failed == 0 else 1
 
