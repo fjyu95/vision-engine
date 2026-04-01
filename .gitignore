@@ -1,10 +1,16 @@
 test_images/
 ckpts/
+*ckpts
 result*
 dehaze/
 enhance/
 
 *.tif
+*.jpg
+*.png
+
+*.pt
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
