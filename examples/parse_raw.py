@@ -8,6 +8,7 @@
     - numpy
     - imageio / opencv-python / Pillow 任一即可读取 TIFF
 """
+import os
 import sys
 from pathlib import Path
 
@@ -18,7 +19,20 @@ LIB_DIR = Path(__file__).resolve().parent / 'lib'
 if str(LIB_DIR) not in sys.path:
     sys.path.insert(0, str(LIB_DIR))
 
-import raw_utils
+# root_dir = Path(__file__).resolve().parent
+# os.chdir(root_dir)
+
+try:
+    import raw_utils
+except Exception as e:
+    py_ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+    raise SystemExit(
+        "raw_utils 导入失败：此扩展仅支持 Python 3.8（Windows）\n"
+        f"当前解释器：Python {py_ver}\n"
+        "所需文件：lib/raw_utils.cp38-win_amd64.pyd\n"
+        "请切换到与该 .pyd 匹配的 Python 3.8 环境后再运行。\n"
+        f"原始错误：{e}"
+    ) from e
 
 
 SAMPLE_DIR = Path(__file__).resolve().parent / 'sample_images'
@@ -211,10 +225,13 @@ def main():
                 img = read_common_image(fp)
 
             img = normalize_shape(img)
-            img_u8 = to_u8(img)
+            if img.dtype != np.uint8:
+                img_u8 = to_u8(img)
+            else:
+                img_u8 = img.astype(np.uint8, copy=False)
             write_png(out_path, img_u8)
 
-            print(f'  已保存：{out_name}  ({img_u8.shape}, {img_u8.dtype})')
+            print(f'  已保存：{out_name} ({img_u8.shape}, {img.dtype} -> {img_u8.dtype})')
         except Exception as e:
             print(f'  失败：{rel} -> {e}')
 
